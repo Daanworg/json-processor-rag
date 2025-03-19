@@ -1,7 +1,12 @@
 import React, { useState, useCallback, useEffect, useRef } from "react";
+/* eslint-disable-next-line no-unused-vars */
 import * as _ from 'lodash';
 import Papa from 'papaparse';
+import * as XLSX from 'xlsx';
+import * as mammoth from 'mammoth';
+import * as pdfjs from 'pdfjs-dist';
 import './App.css';
+import { openIndexedDB, loadEmbeddings } from './utils/db';
 
 const App = () => {
   // State management
@@ -26,6 +31,8 @@ const App = () => {
     maxValueLength: 1000,
     preserveArrays: true,
   });
+  /* eslint-disable-next-line no-unused-vars */
+  const [dbInstance, setDbInstance] = useState(null);
   
   // References to maintain state across renders
   const processingQueueRef = useRef([]);
@@ -76,30 +83,33 @@ const App = () => {
     }
   }, [mergedDatasets]);
   
-  // Process the next item in the queue
+  // Initialize IndexedDB and load saved embeddings
   useEffect(() => {
-    if (isProcessingQueue && !isProcessing && processingQueue.length > 0) {
-      const nextQueuedItem = processingQueue.find(item => item.status === 'queued');
-      if (nextQueuedItem) {
-        processJsonText(nextQueuedItem.content, nextQueuedItem.fileName, nextQueuedItem.id);
-      } else {
-        setIsProcessingQueue(false);
+    const initDb = async () => {
+      try {
+        const db = await openIndexedDB();
+        const savedEmbeddings = await loadEmbeddings(db);
+        if (savedEmbeddings.length > 0) {
+          console.log(`Loaded ${savedEmbeddings.length} embeddings from IndexedDB`);
+          // Vector store initialization will be implemented in future PR
+        }
+      } catch (error) {
+        console.error("Error initializing IndexedDB:", error);
       }
-    }
-  }, [isProcessingQueue, isProcessing, processingQueue]);
-  
-  // Core function for AI-powered JSON repair (mocked version)
-  const repairJsonWithAI = async (jsonStr) => {
-    // First, try standard parsing as a quick check
-    try {
-      JSON.parse(jsonStr);
-      return { corrected: jsonStr };
-    } catch (parseError) {
-      // Instead of calling a real API, we'll use our local correctJsonSyntax function
-      return correctJsonSyntax(jsonStr);
-    }
+    };
+    
+    initDb();
+  }, []);
+
+  // Add cosine similarity helper
+  /* eslint-disable-next-line no-unused-vars */
+  const cosineSimilarity = (vec1, vec2) => {
+    const dotProduct = vec1.reduce((acc, val, i) => acc + val * vec2[i], 0);
+    const norm1 = Math.sqrt(vec1.reduce((acc, val) => acc + val * val, 0));
+    const norm2 = Math.sqrt(vec2.reduce((acc, val) => acc + val * val, 0));
+    return dotProduct / (norm1 * norm2);
   };
-  
+
   // Function to correct JSON syntax errors
   const correctJsonSyntax = useCallback((jsonStr) => {
     try {
@@ -149,6 +159,92 @@ const App = () => {
       }
     }
   }, []);
+  
+  // Core function for AI-powered JSON repair using Google's Gemini
+  const repairJsonWithAI = useCallback(async (jsonStr) => {
+    // First, try standard parsing as a quick check
+    try {
+      JSON.parse(jsonStr);
+      console.debug('JSON is valid, no repair needed');
+      return { corrected: jsonStr };
+    } catch (parseError) {
+      console.debug('JSON parsing failed:', parseError.message);
+      
+      // Now use Google's Gemini API for repair
+      try {
+        const apiKey = process.env.REACT_APP_GOOGLE_API_KEY;
+        console.debug('API Key exists:', !!apiKey, 'Length:', apiKey?.length);
+        
+        if (!apiKey) {
+          console.warn('Google API key not configured, falling back to basic repair');
+          return correctJsonSyntax(jsonStr);
+        }
+        
+        // Check input length
+        if (jsonStr.length > 12000) {
+          console.warn('JSON string too long for API, truncating');
+          jsonStr = jsonStr.substring(0, 12000);
+        }
+        
+        console.debug('Calling Google Gemini API for JSON repair');
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{
+                parts: [{
+                  text: `Fix the syntax errors in this JSON. Return ONLY the corrected JSON:
+                  
+                  ${jsonStr}`
+                }]
+              }],
+              generationConfig: {
+                temperature: 0.1,
+                maxOutputTokens: 12000
+              }
+            })
+          }
+        );
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => null);
+          console.error('API request failed:', {
+            status: response.status,
+            statusText: response.statusText,
+            error: errorData
+          });
+          throw new Error(`API request failed: ${response.statusText}`);
+        }
+
+        const result = await response.json();
+        console.debug('API response received:', result);
+        
+        if (!result.candidates?.[0]?.content?.parts?.[0]?.text) {
+          console.error('Invalid API response structure:', result);
+          throw new Error('Invalid response from Gemini API');
+        }
+        
+        // Extract and clean the response
+        let correctedJson = result.candidates[0].content.parts[0].text.trim();
+        correctedJson = correctedJson.replace(/```json\s+/g, '').replace(/```/g, '');
+        
+        // Validate the corrected JSON
+        try {
+          JSON.parse(correctedJson);
+          console.debug('Successfully repaired JSON');
+          return { corrected: correctedJson };
+        } catch (validationError) {
+          console.error('API returned invalid JSON:', validationError);
+          throw new Error('API repair resulted in invalid JSON');
+        }
+      } catch (aiError) {
+        console.warn('AI repair failed, falling back to basic repair:', aiError);
+        return correctJsonSyntax(jsonStr);
+      }
+    }
+  }, [correctJsonSyntax]);
   
   // Inspect and extract fields from JSON
   const extractFieldsFromJson = useCallback((json, prefix = '', depth = 0, maxDepth = 3) => {
@@ -398,11 +494,22 @@ const App = () => {
     }
   }, [
     repairJsonWithAI,
-    correctJsonSyntax, 
     extractFieldsFromJson, 
     formatJsonStructure, 
     processingOptions.autoFormat
   ]);
+  
+  // Process the next item in the queue
+  useEffect(() => {
+    if (isProcessingQueue && !isProcessing && processingQueue.length > 0) {
+      const nextQueuedItem = processingQueue.find(item => item.status === 'queued');
+      if (nextQueuedItem) {
+        processJsonText(nextQueuedItem.content, nextQueuedItem.fileName, nextQueuedItem.id);
+      } else {
+        setIsProcessingQueue(false);
+      }
+    }
+  }, [isProcessingQueue, isProcessing, processingQueue, processJsonText]);
   
   // Add JSON to queue
   const addToQueue = useCallback((content, fileName) => {
@@ -431,34 +538,436 @@ const App = () => {
     processJsonText(jsonInputText);
   }, [jsonInputText, isProcessing, processJsonText]);
   
+  const getFileType = (filename) => {
+    const extension = filename.split('.').pop().toLowerCase();
+    const supportedTypes = new Set(['json', 'txt', 'md', 'pdf', 'docx', 'csv', 'xlsx']);
+    return supportedTypes.has(extension) ? extension : 'unknown';
+  };
+
+  const extractStructuredData = useCallback(async (text, fileType, metadata = {}) => {
+    try {
+      const structureDetectionPrompt = `
+        Analyze this content and identify structured data formats:
+        1. Tables of data
+        2. Lists of items
+        3. Key-value pairs
+        4. JSON-like structures
+        5. Measurement data
+        6. Dates and timestamps
+        7. Named entities
+        
+        Content: ${text.substring(0, 3000)}...
+        
+        Respond with a JSON object of detected structures and confidence levels.
+      `;
+      
+      const apiKey = process.env.REACT_APP_GOOGLE_API_KEY;
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: structureDetectionPrompt }] }],
+            generationConfig: {
+              temperature: 0.2,
+              maxOutputTokens: 12000
+            }
+          })
+        }
+      );
+  
+      const result = await response.json();
+      const detectionResult = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      
+      let detectedStructures = {};
+      try {
+        detectedStructures = JSON.parse(detectionResult);
+      } catch (e) {
+        console.warn("Failed to parse structure detection result:", e);
+        detectedStructures = { error: "Failed to parse structure detection" };
+      }
+  
+      // Extract highly confident structures
+      const structuresToExtract = Object.entries(detectedStructures)
+        .filter(([_, confidence]) => confidence > 0.7)
+        .map(([structure]) => structure);
+  
+      const extractedData = {};
+      for (const structure of structuresToExtract) {
+        const extractionPrompt = `
+          Extract all instances of "${structure}" from this content.
+          Format the result as valid JSON.
+          
+          Content: ${text}
+          
+          Return ONLY the extracted JSON.
+        `;
+        
+        const extractionResponse = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: extractionPrompt }] }],
+              generationConfig: {
+                temperature: 0.2,
+                maxOutputTokens: 12000
+              }
+            })
+          }
+        );
+  
+        const extractionResult = await extractionResponse.json();
+        const extractedText = extractionResult.candidates?.[0]?.content?.parts?.[0]?.text;
+        
+        try {
+          extractedData[structure] = JSON.parse(extractedText);
+        } catch (e) {
+          console.warn(`Failed to parse ${structure} extraction:`, e);
+          extractedData[structure] = { error: "Failed to parse extraction" };
+        }
+      }
+  
+      return {
+        detectedStructures,
+        extractedData,
+        fileMetadata: metadata
+      };
+    } catch (e) {
+      console.error("Error in structure detection:", e);
+      return {
+        detectedStructures: {},
+        extractedData: {},
+        fileMetadata: metadata,
+        error: e.message
+      };
+    }
+  }, []);
+
+  // Enhanced metadata extraction with user details and semantic features
+  const enhancedExtractUserDetails = useCallback(async (text) => {
+    try {
+      const prompt = `
+        Analyze this content and extract:
+        1. Personal information (names, emails, roles)
+        2. Incomplete ideas or projects
+        3. Future plans and follow-ups
+        4. Time constraints or deadlines
+        5. Key decisions or action items
+        
+        Return as JSON with these categories.
+        
+        Content: ${text.substring(0, 3000)}...
+      `;
+      
+      const apiKey = process.env.REACT_APP_GOOGLE_API_KEY;
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 12000
+            }
+          })
+        }
+      );
+
+      const result = await response.json();
+      return JSON.parse(result.candidates[0].content.parts[0].text);
+    } catch (e) {
+      console.warn('Failed to extract user details:', e);
+      return {};
+    }
+  }, []);
+
+  // Semantic metadata extraction
+  const extractSemanticMetadata = useCallback(async (text) => {
+    try {
+      const prompt = `
+        Analyze this content and identify:
+        1. Content types (code, prose, data, etc.)
+        2. Programming languages if present
+        3. Technical domains covered
+        4. Document structure type
+        5. Writing style and formality
+        
+        Return as JSON with confidence scores.
+      `;
+      
+      const apiKey = process.env.REACT_APP_GOOGLE_API_KEY;
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 12000
+            }
+          })
+        }
+      );
+
+      const result = await response.json();
+      return JSON.parse(result.candidates[0].content.parts[0].text);
+    } catch (e) {
+      console.warn('Failed to extract semantic metadata:', e);
+      return {};
+    }
+  }, []);
+
+  // Improved chunk document with better parameter handling
+  const improvedChunkDocument = useCallback((text, options = {}) => {
+    const {
+      maxLength = 512,
+      overlap = 50,
+      preserveSentences = true,
+      preserveParagraphs = true
+    } = options;
+
+    // Split text based on preservation settings
+    let chunks = [];
+    if (preserveParagraphs) {
+      const paragraphs = text.split(/\n\s*\n/);
+      
+      paragraphs.forEach(paragraph => {
+        if (paragraph.length <= maxLength) {
+          chunks.push(paragraph);
+          return;
+        }
+        
+        if (preserveSentences) {
+          // Split into sentences and respect boundaries
+          const sentences = paragraph.match(/[^.!?]+[.!?]+/g) || [paragraph];
+          let currentChunk = '';
+          
+          sentences.forEach(sentence => {
+            if (currentChunk.length + sentence.length > maxLength) {
+              if (currentChunk) chunks.push(currentChunk.trim());
+              currentChunk = sentence;
+            } else {
+              currentChunk += ' ' + sentence;
+            }
+          });
+          
+          if (currentChunk) chunks.push(currentChunk.trim());
+        } else {
+          // Simple length-based chunking if not preserving sentences
+          for (let i = 0; i < paragraph.length; i += maxLength - overlap) {
+            chunks.push(paragraph.slice(i, i + maxLength));
+          }
+        }
+      });
+    } else {
+      // Process entire text as one block if not preserving paragraphs
+      if (preserveSentences) {
+        const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+        let currentChunk = '';
+        
+        sentences.forEach(sentence => {
+          if (currentChunk.length + sentence.length > maxLength) {
+            if (currentChunk) chunks.push(currentChunk.trim());
+            currentChunk = sentence;
+          } else {
+            currentChunk += ' ' + sentence;
+          }
+        });
+        
+        if (currentChunk) chunks.push(currentChunk.trim());
+      } else {
+        // Simple length-based chunking
+        for (let i = 0; i < text.length; i += maxLength - overlap) {
+          chunks.push(text.slice(i, i + maxLength));
+        }
+      }
+    }
+
+    // Add overlap if requested and preserving structure
+    if (overlap > 0 && (preserveSentences || preserveParagraphs)) {
+      chunks = chunks.map((chunk, i) => {
+        if (i === 0) return chunk;
+        const prevChunk = chunks[i - 1];
+        const overlapText = prevChunk.slice(-overlap);
+        return overlapText + chunk;
+      });
+    }
+
+    return chunks;
+  }, []);
+
   // Handle file upload
   const handleFileUpload = useCallback((event) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
     
-    Array.from(files).forEach(file => {
-      const reader = new FileReader();
+    Array.from(files).forEach(async (file) => {
+      const fileType = getFileType(file.name);
+      let content = '';
+      let metadata = {};
       
-      reader.onload = (e) => {
-        const content = e.target?.result;
-        if (typeof content === 'string') {
-          addToQueue(content, file.name);
+      try {
+        switch (fileType) {
+          case 'json':
+          case 'txt':
+          case 'md':
+            content = await file.text();
+            break;
+            
+          case 'pdf':
+            const pdfData = await file.arrayBuffer();
+            const pdf = await pdfjs.getDocument({ data: pdfData }).promise;
+            let pdfText = '';
+            
+            for (let i = 1; i <= pdf.numPages; i++) {
+              const page = await pdf.getPage(i);
+              const textContent = await page.getTextContent();
+              pdfText += textContent.items.map(item => item.str).join(' ') + '\n';
+            }
+            
+            content = pdfText;
+            metadata = { pageCount: pdf.numPages };
+            break;
+            
+          case 'docx':
+            const docxBuffer = await file.arrayBuffer();
+            const docxResult = await mammoth.extractRawText({ arrayBuffer: docxBuffer });
+            content = docxResult.value;
+            break;
+            
+          case 'csv':
+            const csvText = await file.text();
+            const csvResult = Papa.parse(csvText, { header: true });
+            content = JSON.stringify(csvResult.data);
+            metadata = { 
+              fields: csvResult.meta.fields,
+              rowCount: csvResult.data.length
+            };
+            break;
+            
+          case 'xlsx':
+            const xlsxBuffer = await file.arrayBuffer();
+            const workbook = XLSX.read(xlsxBuffer);
+            const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+            const xlsxData = XLSX.utils.sheet_to_json(worksheet);
+            content = JSON.stringify(xlsxData);
+            metadata = {
+              sheets: workbook.SheetNames,
+              rowCount: xlsxData.length
+            };
+            break;
+            
+          default:
+            throw new Error(`Unsupported file type: ${fileType}`);
         }
-      };
-      
-      reader.onerror = () => {
-        console.error(`Error reading file ${file.name}`);
-      };
-      
-      reader.readAsText(file);
+        
+        // Extract structured data
+        const structuredData = await extractStructuredData(content, fileType, metadata);
+        const userDetails = await enhancedExtractUserDetails(content);
+        const semanticMetadata = await extractSemanticMetadata(content);
+        
+        // Create chunks with improved algorithm
+        const chunks = improvedChunkDocument(content, {
+          maxLength: processingOptions.maxValueLength,
+          preserveSentences: true,
+          preserveParagraphs: true
+        });
+        
+        // Combine all metadata
+        const enhancedMetadata = {
+          ...metadata,
+          fileType,
+          structures: structuredData.detectedStructures,
+          extractedData: structuredData.extractedData,
+          userDetails,
+          semanticFeatures: semanticMetadata,
+          chunks: {
+            count: chunks.length,
+            averageLength: chunks.reduce((acc, c) => acc + c.length, 0) / chunks.length
+          }
+        };
+        
+        // Add to processing queue with enhanced metadata
+        addToQueue(JSON.stringify({ text: content, metadata: enhancedMetadata, chunks }), file.name);
+        
+      } catch (error) {
+        console.error(`Error processing ${file.name}:`, error);
+        setError(`Error processing ${file.name}: ${error.message}`);
+      }
     });
     
     // Reset input
     event.target.value = '';
-  }, [addToQueue]);
+  }, [
+    addToQueue, 
+    extractStructuredData, 
+    enhancedExtractUserDetails, 
+    extractSemanticMetadata, 
+    improvedChunkDocument,
+    processingOptions.maxValueLength
+  ]);
   
-  // Merge selected JSON entries into a dataset
-  const mergeSelectedEntries = useCallback(() => {
+  // Function to detect schema types from data
+  const detectSchemaTypes = useCallback((records) => {
+    const schema = {};
+    
+    // Get all unique fields across all records
+    const allFields = Array.from(new Set(records.flatMap(Object.keys)));
+    
+    // For each field, determine its type
+    allFields.forEach(field => {
+      // Find records that have this field
+      const recordsWithField = records.filter(r => field in r);
+      
+      if (recordsWithField.length === 0) {
+        schema[field] = 'unknown';
+        return;
+      }
+      
+      // Check types of values for this field
+      const types = new Set();
+      recordsWithField.forEach(record => {
+        const value = record[field];
+        if (value === null) {
+          types.add('null');
+        } else if (Array.isArray(value)) {
+          types.add('array');
+        } else {
+          types.add(typeof value);
+        }
+      });
+      
+      // If all values are of the same type, use that type
+      if (types.size === 1) {
+        schema[field] = [...types][0];
+      } else {
+        // If mixed types, use the most common type or 'mixed'
+        const typeCounts = {};
+        recordsWithField.forEach(record => {
+          const value = record[field];
+          const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+          typeCounts[type] = (typeCounts[type] || 0) + 1;
+        });
+        
+        const mostCommonType = Object.entries(typeCounts)
+          .sort((a, b) => b[1] - a[1])[0][0];
+        
+        schema[field] = types.size > 1 ? `mixed (mostly ${mostCommonType})` : mostCommonType;
+      }
+    });
+    
+    return schema;
+  }, []);
+  
+  // Merge selected JSON entries using AI for intelligent merging
+  const mergeSelectedEntries = useCallback(async () => {
     if (selectedEntries.size === 0) {
       setError("Please select entries to merge");
       return;
@@ -475,98 +984,95 @@ const App = () => {
         return;
       }
       
-      // Create a set of all fields from all entries
-      const allFields = new Set();
-      entriesToMerge.forEach(entry => {
-        entry.fields.forEach(field => allFields.add(field));
-      });
+      console.log("Merging entries:", entriesToMerge.map(e => e.fileName).join(', '));
+      let records = [];
       
-      // Convert each entry to a flattened record
-      const records = [];
-      
-      entriesToMerge.forEach(entry => {
+      // Try AI-powered merge if API key is available
+      const apiKey = process.env.REACT_APP_GOOGLE_API_KEY;
+      if (apiKey) {
         try {
-          const parsedJson = JSON.parse(entry.formattedJson);
+          console.log("Attempting AI-powered merge");
+          let mergePrompt = `Merge these JSON documents intelligently, preserving nested structure:`;
           
-          // Handle different types of JSON structures
-          if (Array.isArray(parsedJson)) {
-            // If it's an array, each element becomes a record
-            parsedJson.forEach(item => {
-              const record = processingOptions.flattenNested
-                ? flattenObject(item)
-                : item;
-                
-              // Add source metadata
-              record._source = entry.fileName;
-              record._timestamp = entry.timestamp;
-              records.push(record);
-            });
-          } else {
-            // If it's an object, it becomes a single record
-            const record = processingOptions.flattenNested
-              ? flattenObject(parsedJson)
-              : parsedJson;
-              
-            // Add source metadata
-            record._source = entry.fileName;
-            record._timestamp = entry.timestamp;
-            records.push(record);
-          }
-        } catch (e) {
-          console.error(`Error processing entry ${entry.id}:`, e);
-        }
-      });
-      
-      // Infer schema from data
-      const schema = {};
-      if (processingOptions.detectSchemas && records.length > 0) {
-        // Get all unique keys
-        const allKeys = new Set();
-        records.forEach(record => {
-          Object.keys(record).forEach(key => allKeys.add(key));
-        });
-        
-        // Determine type for each key
-        allKeys.forEach(key => {
-          const types = new Set();
-          
-          records.forEach(record => {
-            if (key in record) {
-              const value = record[key];
-              if (value === null) {
-                types.add('null');
-              } else if (Array.isArray(value)) {
-                types.add('array');
-              } else {
-                types.add(typeof value);
-              }
-            }
+          entriesToMerge.forEach((entry, index) => {
+            mergePrompt += `\n\nDocument ${index + 1}:\n${entry.formattedJson}`;
           });
           
-          // Assign the most specific type
-          if (types.size === 0) {
-            schema[key] = 'unknown';
-          } else if (types.size === 1) {
-            schema[key] = Array.from(types)[0];
-          } else if (types.has('string')) {
-            schema[key] = 'string';
-          } else if (types.has('number')) {
-            schema[key] = 'number';
-          } else {
-            schema[key] = 'mixed';
+          mergePrompt += `\n\nReturn ONLY the merged JSON with no explanations.`;
+          
+          const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${apiKey}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: mergePrompt }] }],
+                generationConfig: {
+                  temperature: 0.2,
+                  maxOutputTokens: 12000
+                }
+              })
+            }
+          );
+          
+          const result = await response.json();
+          console.log("AI merge response received");
+          
+          if (!result.candidates?.[0]?.content?.parts?.[0]?.text) {
+            throw new Error('Invalid response from Gemini API');
+          }
+          
+          let mergedJson = result.candidates[0].content.parts[0].text.trim();
+          mergedJson = mergedJson.replace(/```json\s+/g, '').replace(/```/g, '');
+          
+          const mergedData = JSON.parse(mergedJson);
+          records = Array.isArray(mergedData) ? mergedData : [mergedData];
+          console.log("AI merge successful, records:", records.length);
+          
+        } catch (aiError) {
+          console.warn('AI merge failed, falling back to basic merge:', aiError);
+        }
+      }
+      
+      if (records.length === 0) {
+        console.log("Using basic merge");
+        records = entriesToMerge.flatMap(entry => {
+          try {
+            const parsedJson = JSON.parse(entry.formattedJson);
+            const result = Array.isArray(parsedJson) ? parsedJson : [parsedJson];
+            console.log(`Successfully parsed entry ${entry.id}, got ${result.length} records`);
+            return result;
+          } catch (e) {
+            console.error(`Error parsing entry ${entry.id}:`, e);
+            return [];
           }
         });
       }
       
-      // Create the dataset
+      if (records.length === 0) {
+        throw new Error("Failed to merge entries: no valid records found");
+      }
+      
+      records = records.map(record => ({
+        ...record,
+        _source: "AI-merged dataset",
+        _timestamp: new Date().toISOString(),
+        _sourceEntries: entriesToMerge.map(e => e.fileName).join(', ')
+      }));
+
+      const schema = detectSchemaTypes(records);
+      console.log("Detected schema:", schema);
+
       const dataset = {
         id: `dataset-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
         name: `Dataset from ${entriesToMerge.length} files`,
         records,
-        fields: Array.from(allFields),
+        fields: Array.from(new Set(records.flatMap(Object.keys))),
         schema,
         timestamp: new Date().toISOString()
       };
+      
+      console.log("Created dataset:", dataset.id, "with", dataset.records.length, "records");
       
       setMergedDatasets(prev => [dataset, ...prev]);
       setActiveDataset(dataset);
@@ -576,15 +1082,19 @@ const App = () => {
       return dataset;
     } catch (e) {
       const errorMessage = e instanceof Error ? e.message : String(e);
+      console.error("Error in mergeSelectedEntries:", errorMessage);
       setError(`Error merging entries: ${errorMessage}`);
       return null;
     }
   }, [
     selectedEntries, 
-    processedEntries, 
-    processingOptions.flattenNested, 
-    processingOptions.detectSchemas,
-    flattenObject
+    processedEntries,
+    setError,
+    setMergedDatasets,
+    setActiveDataset,
+    setActiveTab,
+    setSelectedEntries,
+    detectSchemaTypes
   ]);
   
   // Remove selected entries
@@ -965,15 +1475,10 @@ const App = () => {
                         </label>
                         <input
                           type="file"
-                          accept=".json,.jsonl"
+                          accept=".json,.jsonl,.txt,.md,.pdf,.docx,.csv,.xlsx"
                           multiple
                           onChange={handleFileUpload}
-                          className="block w-full text-sm text-gray-500
-                            file:mr-4 file:py-2 file:px-4
-                            file:rounded-md file:border-0
-                            file:text-sm file:font-semibold
-                            file:bg-blue-50 file:text-blue-700
-                            hover:file:bg-blue-100"
+                          className="block w-full text-sm text-gray-500"
                         />
                       </div>
                     </div>
@@ -1305,8 +1810,7 @@ const App = () => {
                       {mergedDatasets.map(dataset => (
                         <div 
                           key={dataset.id} 
-                          className={`border rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-shadow
-                            ${activeDataset?.id === dataset.id ? 'border-blue-500 ring-2 ring-blue-200' : 'border-gray-200'}`}
+                          className="border rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-shadow"
                         >
                           <div className="p-4 bg-white">
                             <div className="flex justify-between items-start">
@@ -1321,9 +1825,7 @@ const App = () => {
                                 className="text-gray-400 hover:text-red-500"
                                 title="Delete dataset"
                               >
-                                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                                </svg>
+                                ✕
                               </button>
                             </div>
                             <div className="mt-3 flex flex-wrap gap-1">
@@ -1373,8 +1875,7 @@ const App = () => {
                           </div>
                           <div 
                             onClick={() => setActiveDataset(activeDataset?.id === dataset.id ? null : dataset)}
-                            className={`px-4 py-2 text-xs cursor-pointer
-                              ${activeDataset?.id === dataset.id ? 'bg-blue-500 text-white' : 'bg-gray-50 text-gray-700 hover:bg-gray-100'}`}
+                            className="px-4 py-2 text-xs cursor-pointer bg-gray-50 text-gray-700 hover:bg-gray-100"
                           >
                             {activeDataset?.id === dataset.id ? 'Hide details' : 'View details'}
                           </div>
@@ -1449,13 +1950,7 @@ const App = () => {
                                       <tr key={field}>
                                         <td className="px-3 py-2 text-xs text-gray-900 font-mono">{field}</td>
                                         <td className="px-3 py-2 text-xs text-gray-500">
-                                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
-                                            ${activeDataset.schema[field] === 'string' ? 'bg-green-100 text-green-800' : 
-                                              activeDataset.schema[field] === 'number' ? 'bg-blue-100 text-blue-800' :
-                                              activeDataset.schema[field] === 'boolean' ? 'bg-purple-100 text-purple-800' :
-                                              activeDataset.schema[field] === 'object' ? 'bg-yellow-100 text-yellow-800' :
-                                              activeDataset.schema[field] === 'array' ? 'bg-pink-100 text-pink-800' :
-                                              'bg-gray-100 text-gray-800'}`}>
+                                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800">
                                             {activeDataset.schema[field]}
                                           </span>
                                         </td>
@@ -1610,12 +2105,12 @@ const App = () => {
                       {/* Show sample of the RAG structure */}
                       <div className="bg-gray-50 p-3 rounded-md overflow-x-auto">
                         <pre className="text-xs text-gray-800 whitespace-pre">
-{`{
+                          {`{
   "name": "${activeDataset.name}",
   "timestamp": "${activeDataset.timestamp}",
   "documents": [
     {
-      "text": "${((): string => {
+      "text": "${(() => {
         // Find a text content field in the first record for the preview
         const record = activeDataset.records[0] || {};
         const textField = Object.entries(record)
@@ -1625,21 +2120,13 @@ const App = () => {
             !key.startsWith('_')
           );
         
-        if (textField) {
-          return textField[1].toString().substring(0, 100) + '...';
-        } else {
-          return "Sample text content would appear here";
-        }
+        return textField ? 
+          textField[1].toString().substring(0, 100) + '...' : 
+          "Sample text content would appear here";
       })()}",
       "metadata": {
         "source": "${activeDataset.records[0]?._source || 'document.json'}",
-        "timestamp": "${activeDataset.records[0]?._timestamp || new Date().toISOString()}"${
-          Object.entries(activeDataset.records[0] || {})
-            .filter(([key]) => key !== '_source' && key !== '_timestamp' && !key.includes('content'))
-            .slice(0, 3)
-            .map(([key, value]) => `,\n        "${key}": ${JSON.stringify(value)}`)
-            .join('')
-        }
+        "timestamp": "${activeDataset.records[0]?._timestamp || new Date().toISOString()}"
       }
     },
     // Additional documents would appear here
