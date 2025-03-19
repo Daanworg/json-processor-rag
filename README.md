@@ -84,7 +84,7 @@ MIT License - see LICENSE file for details
 
 ## Authors
 
-- [Your Name]
+- Daanworg 
 
 ## Acknowledgments
 
